@@ -1,0 +1,54 @@
+# Calls the collective's scheduled jobs more often than Vercel's Hobby plan allows (once a day).
+# Each service exposes GET /cron/<job>, guarded by Authorization: Bearer <CRON_SECRET>; see its
+# src/cron.ts. A service whose URL secret isn't set is skipped, not failed.
+#
+# Repository secrets (Settings > Secrets and variables > Actions):
+#   STATUS_API_URL, EMAIL_API_URL, PORTAL_API_URL   each service's production base URL
+#   CRON_SECRET                                     the CRON_SECRET set on those Vercel projects
+#   STATUS_CRON_SECRET, EMAIL_CRON_SECRET, PORTAL_CRON_SECRET
+#                                                   optional, when a project uses its own secret
+#
+# GitHub runs schedules at most every five minutes, and may start them a few minutes late.
+name: Scheduled jobs
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # status checks, resuming interrupted email campaigns
+    - cron: "*/15 * * * *"  # expiring stale portal claims and requests
+    - cron: "7 * * * *"     # portal governance (nominations and inactive maintainers)
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Call the jobs due now
+        env:
+          EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
+          STATUS_API_URL: ${{ secrets.STATUS_API_URL }}
+          EMAIL_API_URL: ${{ secrets.EMAIL_API_URL }}
+          PORTAL_API_URL: ${{ secrets.PORTAL_API_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          STATUS_CRON_SECRET: ${{ secrets.STATUS_CRON_SECRET }}
+          EMAIL_CRON_SECRET: ${{ secrets.EMAIL_CRON_SECRET }}
+          PORTAL_CRON_SECRET: ${{ secrets.PORTAL_CRON_SECRET }}
+        run: |
+          failed=0
+          call() { # call <base url> <secret> <job>
+            if [ -z "$1" ] || [ -z "$2" ]; then echo "skip $3 (URL or secret not set)"; return; fi
+            code=$(curl -sS -o /tmp/out -w '%{http_code}' --max-time 280 -H "Authorization: Bearer $2" "${1%/}/cron/$3") || code=000
+            echo "$3 -> HTTP $code $(head -c 300 /tmp/out 2>/dev/null)"
+            case "$code" in 2*) ;; *) failed=1 ;; esac
+          }
+          due() { [ "$EVENT" = "workflow_dispatch" ] || [ "$SCHEDULE" = "$1" ]; }
+          if due "*/5 * * * *"; then
+            call "$STATUS_API_URL" "${STATUS_CRON_SECRET:-$CRON_SECRET}" checks
+            call "$EMAIL_API_URL" "${EMAIL_CRON_SECRET:-$CRON_SECRET}" resume-campaigns
+          fi
+          if due "*/15 * * * *"; then call "$PORTAL_API_URL" "${PORTAL_CRON_SECRET:-$CRON_SECRET}" claims; fi
+          if due "7 * * * *"; then call "$PORTAL_API_URL" "${PORTAL_CRON_SECRET:-$CRON_SECRET}" governance; fi
+          exit $failed
